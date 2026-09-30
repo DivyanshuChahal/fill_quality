@@ -2,9 +2,12 @@ name: Fill Quality Charts
 
 on:
   schedule:
-    # 2:00 PM UTC daily (8:00 PM IST)
-    - cron: '00 14 * * *'
+    # 2:30 PM UTC daily (8:00 PM IST)
+    - cron: '30 14 * * *'
   workflow_dispatch:  # Allow manual trigger
+
+permissions:
+  contents: write     # lets the job push the chart images to the fill-quality-charts branch
 
 jobs:
   fill-quality-charts:
@@ -28,6 +31,10 @@ jobs:
         env:
           DUNE_API_KEY: ${{ secrets.DUNE_API_KEY }}
           SLACK_WEBHOOK_FILL_QUALITY: ${{ secrets.SLACK_WEBHOOK_FILL_QUALITY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # only if this repo is private: push images to a separate PUBLIC repo instead
+          # CHART_REPO: your-name/fill-quality-images
+          # CHART_REPO_TOKEN: ${{ secrets.CHART_REPO_TOKEN }}
         run: |
           python -u fill_quality_charts.py
 
