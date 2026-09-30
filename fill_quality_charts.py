@@ -3,17 +3,27 @@ Fill quality vs Binance -- one chart per pair, posted to Slack every day.
 
 1. Pulls Dune query 8869650 (pair, venue, bps_threshold, n_fills, pct_fills)
 2. Draws one PNG per pair into OUT_DIR
-3. Uploads each PNG to freeimage.host (Slack webhooks can't take files, only image links)
-4. Posts all charts to Slack in one message via the incoming webhook
+3. Pushes the PNGs to a branch of this GitHub repo (CHART_BRANCH). Each run replaces
+   the branch with one fresh commit, so only today's images are kept.
+4. Posts a short header + one message per chart to Slack via the incoming webhook,
+   using raw.githubusercontent.com links to those images.
 
-Env vars (set as GitHub secrets):
+Slack must open the image links without logging in, so the repo that holds the
+images has to be public. If this repo is private, set CHART_REPO to a public repo.
+
+Env vars (GitHub secrets):
   DUNE_API_KEY                 Dune API key
   SLACK_WEBHOOK_FILL_QUALITY   Slack incoming webhook URL (if empty, charts are only saved)
+  GITHUB_TOKEN                 given by GitHub Actions automatically, used to push the images
+  CHART_REPO, CHART_REPO_TOKEN optional: push images to a different (public) repo instead
 
 pip install requests pandas numpy matplotlib
 """
 
 import os
+import shutil
+import subprocess
+import tempfile
 import time
 
 import matplotlib
@@ -27,15 +37,18 @@ from matplotlib.ticker import FixedLocator, FuncFormatter, NullLocator, PercentF
 # ============================== SETTINGS ==============================
 DUNE_API_KEY = os.environ.get("DUNE_API_KEY", "").strip()
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_FILL_QUALITY", "").strip()
+
+# where the images live: a branch of this repo (replaced every run)
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
+CHART_REPO = os.environ.get("CHART_REPO", "").strip() or os.environ.get("GITHUB_REPOSITORY", "").strip()
+CHART_TOKEN = os.environ.get("CHART_REPO_TOKEN", "").strip() or GITHUB_TOKEN
+CHART_BRANCH = "fill-quality-charts"
 QUERY_ID = 8869650
 
 RUN_FRESH = True           # True  = re-run the query first so the charts are always today's data (uses credits)
                            # False = use the last saved result on Dune (only if the query is scheduled on Dune)
 WINDOW_LABEL = "last 1 day"
 OUT_DIR = "fill_quality_pngs"
-
-# freeimage.host public API key (same image host as the quote exec scatter report)
-FREEIMAGE_KEY = "6d207e02198a847aa98d0a2a901485a5"
 
 # "nines"  = stretches the top of the y-axis (90% -> 99% -> 99.9% get equal space)
 #            so lines that sit close to 100% split apart clearly
@@ -278,64 +291,52 @@ def plot_pair(pair, d, markers, style, ran_at):
     return path
 
 
+# --------------------------- image links ------------------------------
+def git(args, cwd):
+    r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+    if r.returncode != 0:
+        msg = (r.stderr or r.stdout).strip()
+        if CHART_TOKEN:
+            msg = msg.replace(CHART_TOKEN, "***")          # never print the token
+        raise RuntimeError(f"git {args[0]} failed: {msg[:300]}")
+    return r.stdout.strip()
+
+
+def publish_to_github(saved, ran_at):
+    """Put today's PNGs on CHART_BRANCH as its only commit (force push = yesterday's images are replaced).
+    Links use the commit id, so every day gets new links and Slack never shows a cached old chart."""
+    work = tempfile.mkdtemp()
+    for _, _, path in saved:
+        shutil.copy(path, work)
+    git(["init", "-q"], work)
+    git(["symbolic-ref", "HEAD", f"refs/heads/{CHART_BRANCH}"], work)
+    git(["config", "user.name", "github-actions[bot]"], work)
+    git(["config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"], work)
+    git(["add", "-A"], work)
+    git(["commit", "-q", "-m", f"fill quality charts, data run at {ran_at} UTC"], work)
+    remote = f"https://x-access-token:{CHART_TOKEN}@github.com/{CHART_REPO}.git"
+    git(["push", "-q", "--force", remote, f"HEAD:refs/heads/{CHART_BRANCH}"], work)
+    sha = git(["rev-parse", "HEAD"], work)
+    shutil.rmtree(work, ignore_errors=True)
+    print(f"pushed {len(saved)} charts to {CHART_REPO}, branch {CHART_BRANCH} ({sha[:7]})")
+    return [(pair, markers, f"https://raw.githubusercontent.com/{CHART_REPO}/{sha}/{os.path.basename(path)}")
+            for pair, markers, path in saved]
+
+
+def link_works(url):
+    """Open the link with no login, the same way Slack will. Waits up to ~1 minute."""
+    for _ in range(6):
+        try:
+            r = requests.get(url, timeout=60)
+            if r.status_code == 200 and r.headers.get("content-type", "").startswith("image/"):
+                return True
+        except requests.RequestException:
+            pass
+        time.sleep(10)
+    return False
+
+
 # ------------------------------ slack ---------------------------------
-class HostRefused(Exception):
-    """The image host said no (4xx). Trying it again will not help."""
-
-
-def _check(r, url=None):
-    if r.status_code == 200 and url:
-        return url
-    try:
-        msg = r.json().get("error", {}).get("message") or r.text
-    except ValueError:
-        msg = r.text
-    err = f"{r.status_code} {str(msg)[:200]}"
-    raise HostRefused(err) if 400 <= r.status_code < 500 and r.status_code != 429 else RuntimeError(err)
-
-
-def upload_freeimage(path):
-    with open(path, "rb") as f:
-        r = requests.post("https://freeimage.host/api/1/upload",
-                          data={"key": FREEIMAGE_KEY, "action": "upload", "format": "json"},
-                          files={"source": f}, timeout=120)
-    url = r.json().get("image", {}).get("url") if r.status_code == 200 else None
-    return _check(r, url)
-
-
-def upload_catbox(path):
-    with open(path, "rb") as f:
-        r = requests.post("https://catbox.moe/user/api.php",
-                          data={"reqtype": "fileupload"}, files={"fileToUpload": f}, timeout=120)
-    url = r.text.strip()
-    return _check(r, url if url.startswith("https://") else None)
-
-
-# tried in this order; if one refuses, the next one is used for the rest of the run
-IMAGE_HOSTS = [("freeimage.host", upload_freeimage), ("catbox.moe", upload_catbox)]
-_refused = set()
-
-
-def upload_image(path):
-    """Upload one PNG and return its public link, or None if every host failed."""
-    for name, fn in IMAGE_HOSTS:
-        if name in _refused:
-            continue
-        for attempt in (1, 2):
-            try:
-                url = fn(path)
-                print(f"  uploaded {os.path.basename(path)} to {name}")
-                return url
-            except HostRefused as e:
-                print(f"  {name} refused {os.path.basename(path)}: {e}  -> using next host from now on")
-                _refused.add(name)
-                break
-            except Exception as e:
-                print(f"  {name} try {attempt} failed for {os.path.basename(path)}: {e}")
-                time.sleep(5)
-    return None
-
-
 def slack_send(payload, what):
     """Send one message to the webhook. Retries on Slack server errors (5xx) and rate limits (429)."""
     err = ""
@@ -356,9 +357,7 @@ def slack_send(payload, what):
 
 
 def post_to_slack(charts, ran_at, skipped):
-    """charts = list of (pair, markers, image_url).
-    One short header message, then one message per chart. Small messages are fast for
-    Slack to check, and if one chart fails the others still get posted."""
+    """charts = list of (pair, markers, image_url). Header message first, then one message per chart."""
     title = f"Fill quality vs Binance ({WINDOW_LABEL})"
     header = {"text": title, "blocks": [
         {"type": "header", "text": {"type": "plain_text", "text": title}},
@@ -368,24 +367,27 @@ def post_to_slack(charts, ran_at, skipped):
                                "Venue names show fill count in brackets. "
                                f"Dune query {QUERY_ID}, data run at {ran_at} UTC."}]},
     ]}
-    failed = [] if slack_send(header, "header") else ["header"]
+    if not slack_send(header, "header"):
+        raise RuntimeError("Slack header post failed, so the charts were not sent.")
 
+    failed = []
     for pair, (m1, m2), url in charts:
         time.sleep(1.2)                    # webhooks allow about 1 message per second
-        label = f"{pair}  ·  dotted lines at {m1:g} and {m2:g} bps"
         msg = {"text": f"{title}: {pair}", "blocks": [
             {"type": "image", "image_url": url, "alt_text": f"{pair} fill quality curve",
-             "title": {"type": "plain_text", "text": label}}]}
-        if not slack_send(msg, pair):
+             "title": {"type": "plain_text", "text": f"{pair}  ·  dotted lines at {m1:g} and {m2:g} bps"}}]}
+        if slack_send(msg, pair):
+            print(f"  posted {pair}")
+        else:
             failed.append(pair)
 
     if skipped:
         time.sleep(1.2)
         slack_send({"text": "Not shown: " + ", ".join(skipped)}, "not-shown note")
 
-    print(f"posted {len(charts) - len([f for f in failed if f != 'header'])} of {len(charts)} charts to Slack")
+    print(f"posted {len(charts) - len(failed)} of {len(charts)} charts to Slack")
     if failed:
-        raise RuntimeError(f"Some Slack posts failed: {failed}")
+        raise RuntimeError(f"Some charts were not posted: {failed}")
 
 
 # ------------------------------ main ----------------------------------
@@ -415,17 +417,15 @@ def main():
     if not SLACK_WEBHOOK_URL:
         print(f"SLACK_WEBHOOK_FILL_QUALITY is empty, so charts are only saved in {OUT_DIR}/")
         return
+    if not (CHART_REPO and CHART_TOKEN):
+        raise SystemExit("GITHUB_REPOSITORY / GITHUB_TOKEN missing. This part runs on GitHub Actions "
+                         "(see the yml), or set CHART_REPO + CHART_REPO_TOKEN.")
 
-    charts = []
-    for pair, markers, path in saved:
-        url = upload_image(path)
-        if url:
-            charts.append((pair, markers, url))
-        else:
-            skipped.append(f"{pair} (image upload failed)")
-    if not charts:
-        raise RuntimeError("No chart could be uploaded, so nothing was posted to Slack.")
-
+    charts = publish_to_github(saved, ran_at)
+    if not link_works(charts[0][2]):
+        raise RuntimeError(f"Slack could not open the image link {charts[0][2]}\n"
+                           f"-> This happens when {CHART_REPO} is private. Make it public, or set "
+                           "CHART_REPO to a public repo (plus CHART_REPO_TOKEN that can push to it).")
     post_to_slack(charts, ran_at, skipped)
 
 
