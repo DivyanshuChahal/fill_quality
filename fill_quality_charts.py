@@ -70,8 +70,12 @@ MARKERS = {
     "USDC/USDT":  (0.2, 0.3),
 }
 
-# x-axis shows 0 -> (X_ZOOM x the bigger marker), capped at 50 bps
+# x-axis shows -(X_ZOOM x bigger marker) -> +(X_ZOOM x bigger marker),
+# cut to the bps range the query has (right now -10 to 50)
 X_ZOOM = 2.0
+
+# also draw a line at 0 bps (= Binance price) and show "% of fills <= 0 bps" in the table
+ZERO_COLUMN = True
 # ======================================================================
 
 API = "https://api.dune.com/api/v1"
@@ -164,25 +168,28 @@ def value_at(x, y, bps):
 def plot_pair(pair, d, markers, style, ran_at):
     m1, m2 = markers
     x_max = min(50.0, X_ZOOM * max(markers))
+    x_min = max(float(d["bps_threshold"].min()), -x_max)     # same distance on the negative side, if data goes that far
+    levels = ([0.0] if ZERO_COLUMN and x_min < 0 else []) + [m1, m2]
+    k1 = levels.index(m1)
 
-    # one entry per venue: x, y, fills, value at each marker
+    # one entry per venue: x, y, fills, value at each level
     lines = []
     for v, g in d.groupby("venue"):
         g = g.sort_values("bps_threshold")
         x, y = g["bps_threshold"].to_numpy(), g["pct_fills"].to_numpy()
         lines.append(dict(venue=v, x=x, y=y, n=int(g["n_fills"].iloc[0]),
-                          v1=value_at(x, y, m1), v2=value_at(x, y, m2)))
-    # best first (by first marker, then second)
-    lines.sort(key=lambda L: (-np.nan_to_num(L["v1"], nan=-1), -np.nan_to_num(L["v2"], nan=-1)))
+                          vals=[value_at(x, y, m) for m in levels]))
+    # best first: by the first dotted line, then the second
+    lines.sort(key=lambda L: tuple(-np.nan_to_num(L["vals"][i], nan=-1) for i in range(k1, len(levels))))
 
-    view = np.concatenate([L["y"][L["x"] <= x_max] for L in lines])
-    lo = max(view.min(), 0.005)
+    view = np.concatenate([L["y"][(L["x"] >= x_min - 1e-9) & (L["x"] <= x_max + 1e-9)] for L in lines])
+    lo = max(view.min(), 0.005)                             # below 0.5% is too few fills to matter
     has_100 = bool((view >= 1).any())
     below_100 = view[view < 1]
     hi = below_100.max() if below_100.size else 0.999
 
     fig = plt.figure(figsize=(19, 9.5), dpi=150)
-    gs = fig.add_gridspec(1, 2, width_ratios=[2.3, 1.25], wspace=0.03)
+    gs = fig.add_gridspec(1, 2, width_ratios=[2.2, 1.45], wspace=0.03)
     ax = fig.add_subplot(gs[0])
     tb = fig.add_subplot(gs[1])
     tb.axis("off")
@@ -191,11 +198,11 @@ def plot_pair(pair, d, markers, style, ran_at):
     if Y_AXIS == "nines":
         top = expit(logit(max(hi, lo)) + 0.7)          # "100%" sits one small step above the best real value
         y_lo, y_hi = expit(logit(lo) - 0.35), expit(logit(top) + 0.25)
-        plot_y = lambda y: np.clip(np.where(y >= 1, top, y), 1e-6, None)
+        plot_y = lambda y: np.clip(np.where(y >= 1, top, y), 1e-6, None)   # 0% drops below the chart
 
         ax.set_yscale("logit")
         ax.set_ylim(y_lo, y_hi)
-        cand = [0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 0.8, 0.9, 0.95, 0.98, 0.99,
+        cand = [0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 0.8, 0.9, 0.95, 0.98, 0.99,
                 0.995, 0.998, 0.999, 0.9995, 0.9998, 0.9999, 0.99995, 0.99999]
         ceiling = expit(logit(top) - 0.3) if has_100 else y_hi
         cand = [t for t in cand if y_lo <= t <= ceiling]
@@ -213,14 +220,28 @@ def plot_pair(pair, d, markers, style, ran_at):
         ax.set_ylim(max(0, lo - 0.03), 1.005)
         ax.yaxis.set_major_formatter(PercentFormatter(1.0, decimals=0))
 
+    pad = 0.02 * (x_max - x_min)
+    ax.set_xlim(x_min - pad, x_max + pad)
+
+    # ---- better / worse than Binance ----
+    if x_min < 0:
+        ax.axvspan(x_min - pad, 0, color="#2ca02c", alpha=0.06, lw=0, zorder=0)
+        ax.axvline(0, color="#555555", lw=1.4, zorder=2)
+        box = dict(facecolor="white", edgecolor="none", alpha=0.85, pad=2)
+        roomy = (0 - (x_min - pad)) / (x_max - x_min + 2 * pad) > 0.28     # is the green side wide enough?
+        ax.annotate("← better than Binance" if roomy else "← better", xy=(0, 0), xycoords=("data", "axes fraction"),
+                    xytext=(-8, 8), textcoords="offset points", ha="right", va="bottom",
+                    fontsize=12, color="#1e7b1e", fontweight="bold", bbox=box, zorder=6)
+        ax.annotate("worse than Binance →" if roomy else "worse →", xy=(0, 0), xycoords=("data", "axes fraction"),
+                    xytext=(8, 8), textcoords="offset points", ha="left", va="bottom",
+                    fontsize=12, color="#a33a3a", fontweight="bold", bbox=box, zorder=6)
+
     # ---- venue lines ----
     for L in reversed(lines):                           # best venue drawn last = on top
         c, mk = style[L["venue"]]
-        keep = L["x"] <= x_max * 1.001
-        ax.plot(L["x"][keep], plot_y(L["y"][keep]), color=c, lw=2.4, marker=mk, ms=5,
-                alpha=0.95, zorder=3)
+        ax.plot(L["x"], plot_y(L["y"]), color=c, lw=2.4, marker=mk, ms=5, alpha=0.95, zorder=3)
 
-    # ---- dotted marker lines + dots where each venue crosses them ----
+    # ---- dotted lines at your bps levels (+ dots where each venue crosses every level) ----
     for m in (m1, m2):
         ax.axvline(m, color="#222222", ls=(0, (1.5, 2.5)), lw=1.8, zorder=2)
         left = m == m1                                   # first label sits left of its line, second sits right
@@ -228,57 +249,59 @@ def plot_pair(pair, d, markers, style, ran_at):
                     xytext=(-5 if left else 5, 6), textcoords="offset points",
                     ha="right" if left else "left", va="bottom",
                     fontsize=14, fontweight="bold", color="#222222")
+    for i, m in enumerate(levels):
         for L in lines:
-            val = L["v1"] if m == m1 else L["v2"]
+            val = L["vals"][i]
             if not np.isnan(val):
                 c, mk = style[L["venue"]]
                 ax.scatter([m], plot_y(np.array([val])), s=110, color=c, marker=mk,
                            edgecolor="white", linewidth=1.5, zorder=5)
 
-    ax.set_xlim(0, x_max * 1.02)
     ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
     ax.set_xlabel("Spread vs Binance (bps)", fontsize=14)
-    ax.set_ylabel("% of fills within ±X bps", fontsize=14)
+    ax.set_ylabel("% of fills with spread ≤ X bps", fontsize=14)
     ax.tick_params(labelsize=12)
     ax.grid(True, axis="y", color="#dddddd", lw=0.9)
     ax.grid(True, axis="x", color="#f0f0f0", lw=0.8)
-    for s in ("top", "right"):
-        ax.spines[s].set_visible(False)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
 
-    note = "  ·  y-axis stretched near 100% so small gaps are visible" if Y_AXIS == "nines" else ""
-    ax.text(0, 1.14, f"{pair}  —  % of fills within ±X bps of Binance",
+    note = "  ·  y-axis stretched near 0% and 100% so small gaps are visible" if Y_AXIS == "nines" else ""
+    ax.text(0, 1.14, f"{pair}  —  % of fills with spread ≤ X bps vs Binance",
             transform=ax.transAxes, fontsize=19, fontweight="bold")
-    ax.text(0, 1.095, f"{WINDOW_LABEL}  ·  higher and further left = better{note}",
+    ax.text(0, 1.095, f"{WINDOW_LABEL}  ·  below 0 = better price than Binance  ·  higher = better{note}",
             transform=ax.transAxes, fontsize=12.5, color="#555555")
 
-    # ---- right panel: venue (fills) + value at each dotted line ----
+    # ---- right panel: venue (fills) + value at each level ----
     n = len(lines)
     step = min(0.075, 0.86 / (n + 1))
     y0 = 0.93
-    cols = (0.79, 0.99)
+    cols = (0.61, 0.80, 0.99) if len(levels) == 3 else (0.79, 0.99)
     tb.text(0.02, y0, "Venue (fills)", fontsize=13, fontweight="bold", va="center", transform=tb.transAxes)
-    for cx, m in zip(cols, (m1, m2)):
-        tb.text(cx, y0, f"{m:g} bps", fontsize=13, fontweight="bold", ha="right", va="center",
+    for cx, m in zip(cols, levels):
+        tb.text(cx, y0, f"≤ {m:g} bps", fontsize=12.5 if len(levels) == 3 else 13, fontweight="bold", ha="right", va="center",
                 transform=tb.transAxes)
     tb.plot([0.0, 1.0], [y0 - step * 0.55] * 2, color="#333333", lw=1.2, transform=tb.transAxes, clip_on=False)
 
-    best1 = np.nanmax([L["v1"] for L in lines]) if n else np.nan
-    best2 = np.nanmax([L["v2"] for L in lines]) if n else np.nan
-    for i, L in enumerate(lines):
-        yy = y0 - step * (i + 1)
+    best = [np.nanmax([L["vals"][i] for L in lines]) for i in range(len(levels))]
+    name_max = 14 if len(levels) == 3 else 20
+    for r, L in enumerate(lines):
+        yy = y0 - step * (r + 1)
         c, mk = style[L["venue"]]
-        name = L["venue"] if len(L["venue"]) <= 20 else L["venue"][:19] + "…"
+        name = L["venue"] if len(L["venue"]) <= name_max else L["venue"][:name_max - 1] + "…"
         tb.scatter([0.035], [yy], s=110, color=c, marker=mk, edgecolor="white", linewidth=1.2,
                    transform=tb.transAxes, clip_on=False)
         tb.text(0.075, yy, f"{name} ({L['n']:,})", fontsize=12.5, va="center", transform=tb.transAxes)
-        for cx, val, best in zip(cols, (L["v1"], L["v2"]), (best1, best2)):
+        for cx, val, b in zip(cols, L["vals"], best):
             tb.text(cx, yy, pct_text(val), fontsize=12.5, ha="right", va="center",
-                    fontweight="bold" if np.isclose(val, best) else "normal",
+                    fontweight="bold" if np.isclose(val, b) else "normal",
                     color=c, transform=tb.transAxes)
         tb.plot([0.0, 1.0], [yy - step / 2] * 2, color="#eeeeee", lw=0.8, transform=tb.transAxes, clip_on=False)
 
-    tb.text(0.02, y0 - step * (n + 1.2), "sorted best → worst at the first dotted line\nbold = best in that column",
-            fontsize=10.5, color="#777777", va="top", transform=tb.transAxes)
+    foot = "sorted best → worst at the first dotted line\nbold = best in that column"
+    if 0.0 in levels:
+        foot += "\n≤ 0 bps = got Binance price or better"
+    tb.text(0.02, y0 - step * (n + 1.2), foot, fontsize=10.5, color="#777777", va="top", transform=tb.transAxes)
 
     fig.text(0.01, 0.005, f"Source: Dune query {QUERY_ID}  ·  data run at {ran_at} UTC",
              fontsize=10, color="#888888")
@@ -363,7 +386,8 @@ def post_to_slack(charts, ran_at, skipped):
         {"type": "header", "text": {"type": "plain_text", "text": title}},
         {"type": "context",
          "elements": [{"type": "mrkdwn",
-                       "text": "% of fills within ±X bps of Binance, per venue. Higher and further left = better. "
+                       "text": "% of fills with spread ≤ X bps vs Binance, per venue. Below 0 = better price than Binance. "
+                               "Higher = better. "
                                "Venue names show fill count in brackets. "
                                f"Dune query {QUERY_ID}, data run at {ran_at} UTC."}]},
     ]}
