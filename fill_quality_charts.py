@@ -279,19 +279,60 @@ def plot_pair(pair, d, markers, style, ran_at):
 
 
 # ------------------------------ slack ---------------------------------
+class HostRefused(Exception):
+    """The image host said no (4xx). Trying it again will not help."""
+
+
+def _check(r, url=None):
+    if r.status_code == 200 and url:
+        return url
+    try:
+        msg = r.json().get("error", {}).get("message") or r.text
+    except ValueError:
+        msg = r.text
+    err = f"{r.status_code} {str(msg)[:200]}"
+    raise HostRefused(err) if 400 <= r.status_code < 500 and r.status_code != 429 else RuntimeError(err)
+
+
+def upload_freeimage(path):
+    with open(path, "rb") as f:
+        r = requests.post("https://freeimage.host/api/1/upload",
+                          data={"key": FREEIMAGE_KEY, "action": "upload", "format": "json"},
+                          files={"source": f}, timeout=120)
+    url = r.json().get("image", {}).get("url") if r.status_code == 200 else None
+    return _check(r, url)
+
+
+def upload_catbox(path):
+    with open(path, "rb") as f:
+        r = requests.post("https://catbox.moe/user/api.php",
+                          data={"reqtype": "fileupload"}, files={"fileToUpload": f}, timeout=120)
+    url = r.text.strip()
+    return _check(r, url if url.startswith("https://") else None)
+
+
+# tried in this order; if one refuses, the next one is used for the rest of the run
+IMAGE_HOSTS = [("freeimage.host", upload_freeimage), ("catbox.moe", upload_catbox)]
+_refused = set()
+
+
 def upload_image(path):
-    """Upload one PNG to freeimage.host and return its public link. Tries 3 times."""
-    for attempt in range(1, 4):
-        try:
-            with open(path, "rb") as f:
-                r = requests.post("https://freeimage.host/api/1/upload",
-                                  data={"key": FREEIMAGE_KEY, "action": "upload", "format": "json"},
-                                  files={"source": f}, timeout=120)
-            r.raise_for_status()
-            return r.json()["image"]["url"]
-        except Exception as e:
-            print(f"  upload try {attempt} failed for {path}: {e}")
-            time.sleep(5 * attempt)
+    """Upload one PNG and return its public link, or None if every host failed."""
+    for name, fn in IMAGE_HOSTS:
+        if name in _refused:
+            continue
+        for attempt in (1, 2):
+            try:
+                url = fn(path)
+                print(f"  uploaded {os.path.basename(path)} to {name}")
+                return url
+            except HostRefused as e:
+                print(f"  {name} refused {os.path.basename(path)}: {e}  -> using next host from now on")
+                _refused.add(name)
+                break
+            except Exception as e:
+                print(f"  {name} try {attempt} failed for {os.path.basename(path)}: {e}")
+                time.sleep(5)
     return None
 
 
