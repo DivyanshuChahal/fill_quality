@@ -295,30 +295,56 @@ def upload_image(path):
     return None
 
 
+def slack_send(payload, what):
+    """Send one message to the webhook. Retries on Slack server errors (5xx) and rate limits (429)."""
+    err = ""
+    for attempt in range(1, 4):
+        try:
+            r = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=60)
+            if r.status_code == 200:
+                return True
+            err = f"{r.status_code} {r.text[:200]}"
+            if r.status_code < 500 and r.status_code != 429:
+                break                      # bad message, retrying will not help
+        except requests.RequestException as e:
+            err = str(e)
+        print(f"  slack try {attempt} failed for {what}: {err}")
+        time.sleep(15 * attempt)
+    print(f"  gave up on {what}: {err}")
+    return False
+
+
 def post_to_slack(charts, ran_at, skipped):
-    """charts = list of (pair, markers, image_url). One Slack message with all charts."""
-    blocks = [
-        {"type": "header",
-         "text": {"type": "plain_text", "text": f"Fill quality vs Binance ({WINDOW_LABEL})"}},
+    """charts = list of (pair, markers, image_url).
+    One short header message, then one message per chart. Small messages are fast for
+    Slack to check, and if one chart fails the others still get posted."""
+    title = f"Fill quality vs Binance ({WINDOW_LABEL})"
+    header = {"text": title, "blocks": [
+        {"type": "header", "text": {"type": "plain_text", "text": title}},
         {"type": "context",
          "elements": [{"type": "mrkdwn",
                        "text": "% of fills within ±X bps of Binance, per venue. Higher and further left = better. "
                                "Venue names show fill count in brackets. "
                                f"Dune query {QUERY_ID}, data run at {ran_at} UTC."}]},
-    ]
-    for pair, (m1, m2), url in charts:
-        blocks.append({"type": "image", "image_url": url,
-                       "alt_text": f"{pair} fill quality curve",
-                       "title": {"type": "plain_text", "text": f"{pair}  ·  dotted lines at {m1:g} and {m2:g} bps"}})
-    if skipped:
-        blocks.append({"type": "context",
-                       "elements": [{"type": "mrkdwn", "text": "Not shown: " + ", ".join(skipped)}]})
+    ]}
+    failed = [] if slack_send(header, "header") else ["header"]
 
-    r = requests.post(SLACK_WEBHOOK_URL, json={"text": f"Fill quality vs Binance ({WINDOW_LABEL})", "blocks": blocks},
-                      timeout=60)
-    if r.status_code != 200:
-        raise RuntimeError(f"Slack post failed: {r.status_code} {r.text}")
-    print(f"posted {len(charts)} charts to Slack")
+    for pair, (m1, m2), url in charts:
+        time.sleep(1.2)                    # webhooks allow about 1 message per second
+        label = f"{pair}  ·  dotted lines at {m1:g} and {m2:g} bps"
+        msg = {"text": f"{title}: {pair}", "blocks": [
+            {"type": "image", "image_url": url, "alt_text": f"{pair} fill quality curve",
+             "title": {"type": "plain_text", "text": label}}]}
+        if not slack_send(msg, pair):
+            failed.append(pair)
+
+    if skipped:
+        time.sleep(1.2)
+        slack_send({"text": "Not shown: " + ", ".join(skipped)}, "not-shown note")
+
+    print(f"posted {len(charts) - len([f for f in failed if f != 'header'])} of {len(charts)} charts to Slack")
+    if failed:
+        raise RuntimeError(f"Some Slack posts failed: {failed}")
 
 
 # ------------------------------ main ----------------------------------
