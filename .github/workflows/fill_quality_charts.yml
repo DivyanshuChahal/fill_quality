@@ -2,8 +2,8 @@ name: Fill Quality Charts
 
 on:
   schedule:
-    # 2:30 PM UTC daily (8:00 PM IST)
-    - cron: '30 14 * * *'
+    # 2:00 PM UTC daily (8:00 PM IST)
+    - cron: '00 14 * * *'
   workflow_dispatch:  # Allow manual trigger
 
 permissions:
