@@ -29,7 +29,7 @@ jobs:
           DUNE_API_KEY: ${{ secrets.DUNE_API_KEY }}
           SLACK_WEBHOOK_FILL_QUALITY: ${{ secrets.SLACK_WEBHOOK_FILL_QUALITY }}
         run: |
-          python fill_quality_charts.py
+          python -u fill_quality_charts.py
 
       - name: Upload charts artifact
         if: always()
