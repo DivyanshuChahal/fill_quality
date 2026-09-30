@@ -1,0 +1,41 @@
+name: Fill Quality Charts
+
+on:
+  schedule:
+    # 2:00 PM UTC daily (8:00 PM IST)
+    - cron: '00 14 * * *'
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  fill-quality-charts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas numpy matplotlib
+
+      - name: Make charts and post to Slack
+        env:
+          DUNE_API_KEY: ${{ secrets.DUNE_API_KEY }}
+          SLACK_WEBHOOK_FILL_QUALITY: ${{ secrets.SLACK_WEBHOOK_FILL_QUALITY }}
+        run: |
+          python fill_quality_charts.py
+
+      - name: Upload charts artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fill-quality-charts
+          path: fill_quality_pngs/*.png
+          retention-days: 7
+          if-no-files-found: ignore
