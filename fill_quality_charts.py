@@ -127,6 +127,9 @@ def load_data():
     df["bps_threshold"] = df["bps_threshold"].astype(float)
     df["pct_fills"] = df["pct_fills"].astype(float)
     df["n_fills"] = df["n_fills"].astype(int)
+    for col in ("volume_usd", "pct_volume"):           # volume table (optional columns)
+        if col in df.columns:
+            df[col] = df[col].astype(float)
 
     ran_at = str(meta.get("execution_ended_at", ""))[:16].replace("T", " ")
     print(f"Loaded {len(df):,} rows. Data from Dune run at {ran_at} UTC")
@@ -164,6 +167,47 @@ def value_at(x, y, bps):
     return float(y[hit][0]) if hit.any() else np.nan
 
 
+def usd_text(v):
+    if np.isnan(v):
+        return "-"
+    for div, suffix in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if v >= div:
+            return f"${v / div:.1f}{suffix}"
+    return f"${v:,.0f}"
+
+
+def draw_table(tb, heading, first_col, rows, levels, k1, style, key, bracket, foot):
+    """One table: venue (bracket) + value at each level. Sorted best -> worst at the first dotted line."""
+    rows = sorted(rows, key=lambda L: tuple(-np.nan_to_num(L[key][i], nan=-1) for i in range(k1, len(levels))))
+    n = len(rows)
+    step = min(0.075, 0.86 / (n + 1))
+    y0 = 0.93
+    cols = (0.61, 0.80, 0.99) if len(levels) == 3 else (0.79, 0.99)
+    tb.text(0.02, 1.0, heading, fontsize=14, fontweight="bold", va="center", color="#222222", transform=tb.transAxes)
+    tb.text(0.02, y0, first_col, fontsize=13, fontweight="bold", va="center", transform=tb.transAxes)
+    for cx, m in zip(cols, levels):
+        tb.text(cx, y0, f"≤ {m:g} bps", fontsize=12.5 if len(levels) == 3 else 13, fontweight="bold", ha="right", va="center",
+                transform=tb.transAxes)
+    tb.plot([0.0, 1.0], [y0 - step * 0.55] * 2, color="#333333", lw=1.2, transform=tb.transAxes, clip_on=False)
+
+    best = [np.nanmax([L[key][i] for L in rows]) for i in range(len(levels))]
+    name_max = 14 if len(levels) == 3 else 20
+    for r, L in enumerate(rows):
+        yy = y0 - step * (r + 1)
+        c, mk = style[L["venue"]]
+        name = L["venue"] if len(L["venue"]) <= name_max else L["venue"][:name_max - 1] + "…"
+        tb.scatter([0.035], [yy], s=110, color=c, marker=mk, edgecolor="white", linewidth=1.2,
+                   transform=tb.transAxes, clip_on=False)
+        tb.text(0.075, yy, f"{name} ({bracket(L)})", fontsize=12.5, va="center", transform=tb.transAxes)
+        for cx, val, b in zip(cols, L[key], best):
+            tb.text(cx, yy, pct_text(val), fontsize=12.5, ha="right", va="center",
+                    fontweight="bold" if np.isclose(val, b) else "normal",
+                    color=c, transform=tb.transAxes)
+        tb.plot([0.0, 1.0], [yy - step / 2] * 2, color="#eeeeee", lw=0.8, transform=tb.transAxes, clip_on=False)
+
+    tb.text(0.02, y0 - step * (n + 1.2), foot, fontsize=10.5, color="#777777", va="top", transform=tb.transAxes)
+
+
 # ----------------------------- chart ----------------------------------
 def plot_pair(pair, d, markers, style, ran_at):
     m1, m2 = markers
@@ -177,8 +221,12 @@ def plot_pair(pair, d, markers, style, ran_at):
     for v, g in d.groupby("venue"):
         g = g.sort_values("bps_threshold")
         x, y = g["bps_threshold"].to_numpy(), g["pct_fills"].to_numpy()
+        has_vol = "pct_volume" in g.columns and "volume_usd" in g.columns
+        yv = g["pct_volume"].to_numpy() if has_vol else np.full(len(x), np.nan)
         lines.append(dict(venue=v, x=x, y=y, n=int(g["n_fills"].iloc[0]),
-                          vals=[value_at(x, y, m) for m in levels]))
+                          vol=float(g["volume_usd"].iloc[0]) if has_vol else np.nan,
+                          vals=[value_at(x, y, m) for m in levels],
+                          vvals=[value_at(x, yv, m) for m in levels]))
     # best first: by the first dotted line, then the second
     lines.sort(key=lambda L: tuple(-np.nan_to_num(L["vals"][i], nan=-1) for i in range(k1, len(levels))))
 
@@ -188,11 +236,13 @@ def plot_pair(pair, d, markers, style, ran_at):
     below_100 = view[view < 1]
     hi = below_100.max() if below_100.size else 0.999
 
-    fig = plt.figure(figsize=(19, 9.5), dpi=150)
-    gs = fig.add_gridspec(1, 2, width_ratios=[2.2, 1.45], wspace=0.03)
-    ax = fig.add_subplot(gs[0])
-    tb = fig.add_subplot(gs[1])
-    tb.axis("off")
+    fig = plt.figure(figsize=(27, 9.5), dpi=150)
+    gs = fig.add_gridspec(1, 3, width_ratios=[1.45, 2.3, 1.45], wspace=0.16, left=0.01, right=0.99)
+    tf = fig.add_subplot(gs[0])                          # left: by fills
+    ax = fig.add_subplot(gs[1])                          # middle: chart (fills)
+    tv = fig.add_subplot(gs[2])                          # right: by volume
+    tf.axis("off")
+    tv.axis("off")
 
     # ---- y-axis ----
     if Y_AXIS == "nines":
@@ -267,41 +317,26 @@ def plot_pair(pair, d, markers, style, ran_at):
         ax.spines[side].set_visible(False)
 
     note = "  ·  y-axis stretched near 0% and 100% so small gaps are visible" if Y_AXIS == "nines" else ""
-    ax.text(0, 1.14, f"{pair}  —  % of fills with spread ≤ X bps vs Binance",
-            transform=ax.transAxes, fontsize=19, fontweight="bold")
+    ax.text(0, 1.14, f"{pair}  —  % of fills with spread ≤ X bps vs Binance (chart = fills)",
+            transform=tf.transAxes, fontsize=19, fontweight="bold")
     ax.text(0, 1.095, f"{WINDOW_LABEL}  ·  below 0 = better price than Binance  ·  higher = better{note}",
-            transform=ax.transAxes, fontsize=12.5, color="#555555")
+            transform=tf.transAxes, fontsize=12.5, color="#555555")
 
-    # ---- right panel: venue (fills) + value at each level ----
-    n = len(lines)
-    step = min(0.075, 0.86 / (n + 1))
-    y0 = 0.93
-    cols = (0.61, 0.80, 0.99) if len(levels) == 3 else (0.79, 0.99)
-    tb.text(0.02, y0, "Venue (fills)", fontsize=13, fontweight="bold", va="center", transform=tb.transAxes)
-    for cx, m in zip(cols, levels):
-        tb.text(cx, y0, f"≤ {m:g} bps", fontsize=12.5 if len(levels) == 3 else 13, fontweight="bold", ha="right", va="center",
-                transform=tb.transAxes)
-    tb.plot([0.0, 1.0], [y0 - step * 0.55] * 2, color="#333333", lw=1.2, transform=tb.transAxes, clip_on=False)
-
-    best = [np.nanmax([L["vals"][i] for L in lines]) for i in range(len(levels))]
-    name_max = 14 if len(levels) == 3 else 20
-    for r, L in enumerate(lines):
-        yy = y0 - step * (r + 1)
-        c, mk = style[L["venue"]]
-        name = L["venue"] if len(L["venue"]) <= name_max else L["venue"][:name_max - 1] + "…"
-        tb.scatter([0.035], [yy], s=110, color=c, marker=mk, edgecolor="white", linewidth=1.2,
-                   transform=tb.transAxes, clip_on=False)
-        tb.text(0.075, yy, f"{name} ({L['n']:,})", fontsize=12.5, va="center", transform=tb.transAxes)
-        for cx, val, b in zip(cols, L["vals"], best):
-            tb.text(cx, yy, pct_text(val), fontsize=12.5, ha="right", va="center",
-                    fontweight="bold" if np.isclose(val, b) else "normal",
-                    color=c, transform=tb.transAxes)
-        tb.plot([0.0, 1.0], [yy - step / 2] * 2, color="#eeeeee", lw=0.8, transform=tb.transAxes, clip_on=False)
-
-    foot = "sorted best → worst at the first dotted line\nbold = best in that column"
-    if 0.0 in levels:
-        foot += "\n≤ 0 bps = got Binance price or better"
-    tb.text(0.02, y0 - step * (n + 1.2), foot, fontsize=10.5, color="#777777", va="top", transform=tb.transAxes)
+    # ---- left table: by fills  |  right table: by volume ----
+    zero_note = "\n≤ 0 bps = got Binance price or better" if 0.0 in levels else ""
+    draw_table(tf, "BY FILLS  ·  % of fills", "Venue (fills)", lines, levels, k1, style, "vals",
+               lambda L: f"{L['n']:,}",
+               "sorted best → worst at the first dotted line\nbold = best in that column" + zero_note)
+    if any(not np.isnan(L["vol"]) for L in lines):
+        draw_table(tv, "BY VOLUME  ·  % of USD volume", "Venue (volume)", lines, levels, k1, style, "vvals",
+                   lambda L: usd_text(L["vol"]),
+                   "sorted best → worst at the first dotted line\nbold = best in that column\n"
+                   "volume = USD size of each fill" + zero_note.replace("got", "volume at"))
+    else:
+        tv.text(0.02, 1.0, "BY VOLUME  ·  % of USD volume", fontsize=14, fontweight="bold", va="center",
+                transform=tv.transAxes)
+        tv.text(0.02, 0.9, "The query has no volume_usd / pct_volume columns yet.", fontsize=12,
+                color="#777777", va="top", transform=tv.transAxes)
 
     fig.text(0.01, 0.005, f"Source: Dune query {QUERY_ID}  ·  data run at {ran_at} UTC",
              fontsize=10, color="#888888")
