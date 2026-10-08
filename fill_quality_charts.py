@@ -127,6 +127,8 @@ def load_data():
     df["bps_threshold"] = df["bps_threshold"].astype(float)
     df["pct_fills"] = df["pct_fills"].astype(float)
     df["n_fills"] = df["n_fills"].astype(int)
+    if "total_vol_usd" in df.columns and "volume_usd" not in df.columns:
+        df = df.rename(columns={"total_vol_usd": "volume_usd"})   # the query names it total_vol_usd
     for col in ("volume_usd", "pct_volume"):           # volume table (optional columns)
         if col in df.columns:
             df[col] = df[col].astype(float)
