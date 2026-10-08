@@ -185,7 +185,7 @@ def draw_table(tb, heading, first_col, rows, levels, k1, style, key, bracket, fo
     step = min(0.075, 0.86 / (n + 1))
     y0 = 0.93
     cols = (0.61, 0.80, 0.99) if len(levels) == 3 else (0.79, 0.99)
-    tb.text(0.02, 1.0, heading, fontsize=14, fontweight="bold", va="center", color="#222222", transform=tb.transAxes)
+    tb.text(0.02, 1.0, heading, fontsize=15, fontweight="bold", va="center", color="#222222", transform=tb.transAxes)
     tb.text(0.02, y0, first_col, fontsize=13, fontweight="bold", va="center", transform=tb.transAxes)
     for cx, m in zip(cols, levels):
         tb.text(cx, y0, f"≤ {m:g} bps", fontsize=12.5 if len(levels) == 3 else 13, fontweight="bold", ha="right", va="center",
@@ -211,40 +211,15 @@ def draw_table(tb, heading, first_col, rows, levels, k1, style, key, bracket, fo
 
 
 # ----------------------------- chart ----------------------------------
-def plot_pair(pair, d, markers, style, ran_at):
+def draw_chart(ax, lines, ykey, vkey, levels, k1, markers, x_min, x_max, style, ylabel):
+    """One curve per venue. ykey = which curve (fills or volume), vkey = its values at each level."""
     m1, m2 = markers
-    x_max = min(50.0, X_ZOOM * max(markers))
-    x_min = max(float(d["bps_threshold"].min()), -x_max)     # same distance on the negative side, if data goes that far
-    levels = ([0.0] if ZERO_COLUMN and x_min < 0 else []) + [m1, m2]
-    k1 = levels.index(m1)
-
-    # one entry per venue: x, y, fills, value at each level
-    lines = []
-    for v, g in d.groupby("venue"):
-        g = g.sort_values("bps_threshold")
-        x, y = g["bps_threshold"].to_numpy(), g["pct_fills"].to_numpy()
-        has_vol = "pct_volume" in g.columns and "volume_usd" in g.columns
-        yv = g["pct_volume"].to_numpy() if has_vol else np.full(len(x), np.nan)
-        lines.append(dict(venue=v, x=x, y=y, n=int(g["n_fills"].iloc[0]),
-                          vol=float(g["volume_usd"].iloc[0]) if has_vol else np.nan,
-                          vals=[value_at(x, y, m) for m in levels],
-                          vvals=[value_at(x, yv, m) for m in levels]))
-    # best first: by the first dotted line, then the second
-    lines.sort(key=lambda L: tuple(-np.nan_to_num(L["vals"][i], nan=-1) for i in range(k1, len(levels))))
-
-    view = np.concatenate([L["y"][(L["x"] >= x_min - 1e-9) & (L["x"] <= x_max + 1e-9)] for L in lines])
+    view = np.concatenate([L[ykey][(L["x"] >= x_min - 1e-9) & (L["x"] <= x_max + 1e-9)] for L in lines])
+    view = view[~np.isnan(view)]
     lo = max(view.min(), 0.005)                             # below 0.5% is too few fills to matter
     has_100 = bool((view >= 1).any())
     below_100 = view[view < 1]
     hi = below_100.max() if below_100.size else 0.999
-
-    fig = plt.figure(figsize=(27, 9.5), dpi=150)
-    gs = fig.add_gridspec(1, 3, width_ratios=[1.45, 2.3, 1.45], wspace=0.16, left=0.01, right=0.99)
-    tf = fig.add_subplot(gs[0])                          # left: by fills
-    ax = fig.add_subplot(gs[1])                          # middle: chart (fills)
-    tv = fig.add_subplot(gs[2])                          # right: by volume
-    tf.axis("off")
-    tv.axis("off")
 
     # ---- y-axis ----
     if Y_AXIS == "nines":
@@ -256,14 +231,13 @@ def plot_pair(pair, d, markers, style, ran_at):
         ax.set_ylim(y_lo, y_hi)
         cand = [0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 0.8, 0.9, 0.95, 0.98, 0.99,
                 0.995, 0.998, 0.999, 0.9995, 0.9998, 0.9999, 0.99995, 0.99999]
-        ceiling = expit(logit(top) - 0.3) if has_100 else y_hi
-        cand = [t for t in cand if y_lo <= t <= ceiling]
+        cand = [t for t in cand if y_lo <= t < (top if has_100 else y_hi)]
         gap = (logit(y_hi) - logit(y_lo)) / 20             # keep tick labels from touching
-        ticks = []
+        ticks = [top] if has_100 else []                   # start from "100%" so nothing crowds it
         for t in reversed(cand):
             if not ticks or logit(ticks[-1]) - logit(t) >= gap:
                 ticks.append(t)
-        ticks = sorted(ticks) + ([top] if has_100 else [])
+        ticks = sorted(ticks)
         ax.yaxis.set_major_locator(FixedLocator(ticks))
         ax.yaxis.set_major_formatter(FuncFormatter(lambda p, _: "100%" if np.isclose(p, top) else tick_text(p)))
         ax.yaxis.set_minor_locator(NullLocator())
@@ -275,23 +249,24 @@ def plot_pair(pair, d, markers, style, ran_at):
     pad = 0.02 * (x_max - x_min)
     ax.set_xlim(x_min - pad, x_max + pad)
 
-    # ---- better / worse than Binance ----
+    # ---- better / worse than Binance (labels at the top, where the lines are not) ----
     if x_min < 0:
         ax.axvspan(x_min - pad, 0, color="#2ca02c", alpha=0.06, lw=0, zorder=0)
         ax.axvline(0, color="#555555", lw=1.4, zorder=2)
         box = dict(facecolor="white", edgecolor="none", alpha=0.85, pad=2)
         roomy = (0 - (x_min - pad)) / (x_max - x_min + 2 * pad) > 0.28     # is the green side wide enough?
-        ax.annotate("← better than Binance" if roomy else "← better", xy=(0, 0), xycoords=("data", "axes fraction"),
-                    xytext=(-8, 8), textcoords="offset points", ha="right", va="bottom",
-                    fontsize=12, color="#1e7b1e", fontweight="bold", bbox=box, zorder=6)
-        ax.annotate("worse than Binance →" if roomy else "worse →", xy=(0, 0), xycoords=("data", "axes fraction"),
-                    xytext=(8, 8), textcoords="offset points", ha="left", va="bottom",
-                    fontsize=12, color="#a33a3a", fontweight="bold", bbox=box, zorder=6)
+        ax.annotate("← better than Binance" if roomy else "← better", xy=(0, 1), xycoords=("data", "axes fraction"),
+                    xytext=(-8, -8), textcoords="offset points", ha="right", va="top",
+                    fontsize=12.5, color="#1e7b1e", fontweight="bold", bbox=box, zorder=6)
+        ax.annotate("worse than Binance →" if roomy else "worse →", xy=(0, 1), xycoords=("data", "axes fraction"),
+                    xytext=(8, -8), textcoords="offset points", ha="left", va="top",
+                    fontsize=12.5, color="#a33a3a", fontweight="bold", bbox=box, zorder=6)
 
-    # ---- venue lines ----
-    for L in reversed(lines):                           # best venue drawn last = on top
+    # ---- venue lines (best venue drawn last = on top) ----
+    order = sorted(lines, key=lambda L: tuple(-np.nan_to_num(L[vkey][i], nan=-1) for i in range(k1, len(levels))))
+    for L in reversed(order):
         c, mk = style[L["venue"]]
-        ax.plot(L["x"], plot_y(L["y"]), color=c, lw=2.4, marker=mk, ms=5, alpha=0.95, zorder=3)
+        ax.plot(L["x"], plot_y(L[ykey]), color=c, lw=2.4, marker=mk, ms=5, alpha=0.95, zorder=3)
 
     # ---- dotted lines at your bps levels (+ dots where each venue crosses every level) ----
     for m in (m1, m2):
@@ -303,7 +278,7 @@ def plot_pair(pair, d, markers, style, ran_at):
                     fontsize=14, fontweight="bold", color="#222222")
     for i, m in enumerate(levels):
         for L in lines:
-            val = L["vals"][i]
+            val = L[vkey][i]
             if not np.isnan(val):
                 c, mk = style[L["venue"]]
                 ax.scatter([m], plot_y(np.array([val])), s=110, color=c, marker=mk,
@@ -311,36 +286,67 @@ def plot_pair(pair, d, markers, style, ran_at):
 
     ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
     ax.set_xlabel("Spread vs Binance (bps)", fontsize=14)
-    ax.set_ylabel("% of fills with spread ≤ X bps", fontsize=14)
+    ax.set_ylabel(ylabel, fontsize=14, labelpad=10)
     ax.tick_params(labelsize=12)
     ax.grid(True, axis="y", color="#dddddd", lw=0.9)
     ax.grid(True, axis="x", color="#f0f0f0", lw=0.8)
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
 
-    note = "  ·  y-axis stretched near 0% and 100% so small gaps are visible" if Y_AXIS == "nines" else ""
-    ax.text(0, 1.14, f"{pair}  —  % of fills with spread ≤ X bps vs Binance (chart = fills)",
-            transform=tf.transAxes, fontsize=19, fontweight="bold")
-    ax.text(0, 1.095, f"{WINDOW_LABEL}  ·  below 0 = better price than Binance  ·  higher = better{note}",
-            transform=tf.transAxes, fontsize=12.5, color="#555555")
 
-    # ---- left table: by fills  |  right table: by volume ----
+def plot_pair(pair, d, markers, style, ran_at):
+    m1, m2 = markers
+    x_max = min(50.0, X_ZOOM * max(markers))
+    x_min = max(float(d["bps_threshold"].min()), -x_max)     # same distance on the negative side, if data goes that far
+    levels = ([0.0] if ZERO_COLUMN and x_min < 0 else []) + [m1, m2]
+    k1 = levels.index(m1)
+
+    # one entry per venue: x, fills curve, volume curve, totals, value at each level
+    lines = []
+    for v, g in d.groupby("venue"):
+        g = g.sort_values("bps_threshold")
+        x, y = g["bps_threshold"].to_numpy(), g["pct_fills"].to_numpy()
+        has_vol = "pct_volume" in g.columns and "volume_usd" in g.columns
+        yv = g["pct_volume"].to_numpy() if has_vol else np.full(len(x), np.nan)
+        lines.append(dict(venue=v, x=x, y=y, yv=yv, n=int(g["n_fills"].iloc[0]),
+                          vol=float(g["volume_usd"].iloc[0]) if has_vol else np.nan,
+                          vals=[value_at(x, y, m) for m in levels],
+                          vvals=[value_at(x, yv, m) for m in levels]))
+    has_vol = any(not np.isnan(L["vol"]) for L in lines)
+
+    # layout: one row per view -> [table | chart]. Row 1 = fills, row 2 = volume.
+    # wspace leaves a clear gap so the table never touches the chart's y-axis labels.
+    nrows = 2 if has_vol else 1
+    fig = plt.figure(figsize=(22, 9.8 * nrows), dpi=150)
+    gs = fig.add_gridspec(nrows, 2, width_ratios=[1.45, 2.4], wspace=0.17, hspace=0.26, left=0.01, right=0.99,
+                          top=0.92 if nrows == 2 else 0.86, bottom=0.05 if nrows == 2 else 0.09)
     zero_note = "\n≤ 0 bps = got Binance price or better" if 0.0 in levels else ""
-    draw_table(tf, "BY FILLS  ·  % of fills", "Venue (fills)", lines, levels, k1, style, "vals",
+
+    tf, af = fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[0, 1])
+    tf.axis("off")
+    draw_table(tf, "BY FILLS  ·  % of fills with spread ≤ X bps", "Venue (fills)", lines, levels, k1, style, "vals",
                lambda L: f"{L['n']:,}",
                "sorted best → worst at the first dotted line\nbold = best in that column" + zero_note)
-    if any(not np.isnan(L["vol"]) for L in lines):
-        draw_table(tv, "BY VOLUME  ·  % of USD volume", "Venue (volume)", lines, levels, k1, style, "vvals",
-                   lambda L: usd_text(L["vol"]),
+    draw_chart(af, lines, "y", "vals", levels, k1, markers, x_min, x_max, style, "% of fills with spread ≤ X bps")
+
+    if has_vol:
+        tv, av = fig.add_subplot(gs[1, 0]), fig.add_subplot(gs[1, 1])
+        tv.axis("off")
+        draw_table(tv, "BY VOLUME  ·  % of USD volume with spread ≤ X bps", "Venue (volume)", lines, levels, k1,
+                   style, "vvals", lambda L: usd_text(L["vol"]),
                    "sorted best → worst at the first dotted line\nbold = best in that column\n"
                    "volume = USD size of each fill" + zero_note.replace("got", "volume at"))
-    else:
-        tv.text(0.02, 1.0, "BY VOLUME  ·  % of USD volume", fontsize=14, fontweight="bold", va="center",
-                transform=tv.transAxes)
-        tv.text(0.02, 0.9, "The query has no volume_usd / pct_volume columns yet.", fontsize=12,
-                color="#777777", va="top", transform=tv.transAxes)
+        draw_chart(av, lines, "yv", "vvals", levels, k1, markers, x_min, x_max, style,
+                   "% of USD volume with spread ≤ X bps")
 
-    fig.text(0.01, 0.005, f"Source: Dune query {QUERY_ID}  ·  data run at {ran_at} UTC",
+    note = "  ·  y-axis stretched near 0% and 100% so small gaps are visible" if Y_AXIS == "nines" else ""
+    what = "fills and volume" if has_vol else "fills"
+    tf.text(0, 1.14, f"{pair}  —  % of {what} with spread ≤ X bps vs Binance",
+            transform=tf.transAxes, fontsize=21, fontweight="bold")
+    tf.text(0, 1.095, f"{WINDOW_LABEL}  ·  below 0 = better price than Binance  ·  higher line = better{note}",
+            transform=tf.transAxes, fontsize=12.5, color="#555555")
+
+    fig.text(0.01, 0.005 if has_vol else 0.0, f"Source: Dune query {QUERY_ID}  ·  data run at {ran_at} UTC",
              fontsize=10, color="#888888")
 
     os.makedirs(OUT_DIR, exist_ok=True)
